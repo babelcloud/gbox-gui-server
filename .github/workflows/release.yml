@@ -36,7 +36,19 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --onefile --name gbox-gui-server server.py
+          pyinstaller --onefile --name gbox-gui-server `
+            --hidden-import win32timezone `
+            --hidden-import win32serviceutil `
+            --hidden-import win32service `
+            --hidden-import win32event `
+            --hidden-import win32ts `
+            --hidden-import win32process `
+            --hidden-import win32profile `
+            --hidden-import win32security `
+            --hidden-import win32con `
+            --hidden-import servicemanager `
+            --collect-binaries pywin32 `
+            server.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
