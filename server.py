@@ -1,5 +1,5 @@
 """
-GBox Local API Server
+GBOX Local API Server
 Implements gbox.ai UI Action, Command, and File System APIs locally using pyautogui.
 Listens on 0.0.0.0:5789
 """
@@ -749,12 +749,334 @@ def _wrap_wsgi_with_error_catch(wsgi_app):
     return wrapper
 
 
-if __name__ == "__main__":
+def _run_server():
+    """Start the Flask server (blocking)."""
     import sys
-    sys.stderr.write(f"[GBox] Loading {__file__}\n")
-    sys.stderr.write("[GBox] Installing WSGI error wrapper\n")
+    # When spawned as a --child process the console is hidden; write logs to file.
+    log_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "GBOXGUIServer")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "child.log")
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(log_file, encoding="utf-8")],
+        )
+    except Exception:
+        pass
+    sys.stderr.write(f"[GBOX] Loading {__file__}\n")
+    sys.stderr.write("[GBOX] Installing WSGI error wrapper\n")
     sys.stderr.flush()
     app.wsgi_app = _wrap_wsgi_with_error_catch(app.wsgi_app)
-    sys.stderr.write("[GBox] Starting on 0.0.0.0:5789\n")
+    sys.stderr.write("[GBOX] Starting on 0.0.0.0:5789\n")
     sys.stderr.flush()
+    logging.info("[GBOX] Starting Flask on 0.0.0.0:5789")
     app.run(host="0.0.0.0", port=5789, debug=False)
+
+
+
+# ---------------------------------------------------------------------------
+# Windows Service wrapper (pywin32)
+# ---------------------------------------------------------------------------
+# Architecture:
+#   - The SCM service runs in Session 0 (no desktop).
+#   - On start / user logon it calls WTSQueryUserToken + CreateProcessAsUser
+#     to spawn a *hidden* child process of this exe (--child flag) inside the
+#     active interactive desktop session (Session 1).
+#   - The child runs the Flask server there, so pyautogui has full desktop
+#     access and no console window is visible to the user.
+# ---------------------------------------------------------------------------
+
+def _setup_service_logging():
+    """Configure file-based logging for the service (Session 0 has no console)."""
+    log_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "GBOXGUIServer")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "service.log")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    return log_file
+
+
+def _get_service_exe() -> str:
+    """Return the absolute path to this executable.
+
+    sys.argv[0] is unreliable in service context (SCM may pass service name);
+    sys.executable is always the correct frozen exe path in PyInstaller bundles.
+    """
+    import sys as _sys
+    exe = getattr(_sys, "executable", None) or _sys.argv[0]
+    return os.path.abspath(exe)
+
+
+def _find_active_user_session() -> int:
+    """Find a desktop session with a logged-in user.
+
+    Enumerates all WTS sessions and returns the first one that is Active
+    and has a valid user token.  Falls back to WTSGetActiveConsoleSessionId
+    if enumeration finds nothing.  Returns 0xFFFFFFFF if no session is usable.
+    """
+    import win32ts
+
+    WTSActive = 0
+    try:
+        sessions = win32ts.WTSEnumerateSessions(win32ts.WTS_CURRENT_SERVER_HANDLE)
+    except Exception:
+        sid = win32ts.WTSGetActiveConsoleSessionId()
+        return sid
+
+    for session in sessions:
+        sid = session["SessionId"]
+        state = session["State"]
+        if state != WTSActive or sid == 0:
+            continue
+        try:
+            token = win32ts.WTSQueryUserToken(sid)
+            token.Close()
+            logging.info("[GBOXService] found active user session %d", sid)
+            return sid
+        except Exception:
+            continue
+
+    # Fallback
+    return win32ts.WTSGetActiveConsoleSessionId()
+
+
+def _spawn_in_user_session(session_id: int):
+    """Launch a hidden child process in the given user desktop session.
+
+    Returns (pid, process_handle).  Caller is responsible for closing the handle.
+    Requires the service to run as LocalSystem (the default).
+    """
+    import win32con
+    import win32process
+    import win32profile
+    import win32security
+    import win32ts
+
+    user_token = win32ts.WTSQueryUserToken(session_id)
+
+    # pywin32 signature (differs from C API order!):
+    #   DuplicateTokenEx(ExistingToken, ImpersonationLevel, DesiredAccess,
+    #                    TokenType, TokenAttributes=None)
+    dup_token = win32security.DuplicateTokenEx(
+        user_token,
+        win32security.SecurityImpersonation,
+        win32con.MAXIMUM_ALLOWED,
+        win32security.TokenPrimary,
+    )
+
+    try:
+        env = win32profile.CreateEnvironmentBlock(dup_token, False)
+    except Exception:
+        env = None
+
+    exe = _get_service_exe()
+    cmd_line = f'"{exe}" --child'
+    logging.info("[GBOXService] spawning child: %s", cmd_line)
+
+    si = win32process.STARTUPINFO()
+    si.dwFlags = win32con.STARTF_USESHOWWINDOW
+    si.wShowWindow = win32con.SW_HIDE
+    si.lpDesktop = "winsta0\\default"
+
+    # pywin32 signature:
+    #   CreateProcessAsUser(hToken, appName, commandLine, processAttributes,
+    #                       threadAttributes, bInheritHandles, dwCreationFlags,
+    #                       newEnvironment, currentDirectory, startupinfo)
+    proc_h, thread_h, pid, _tid = win32process.CreateProcessAsUser(
+        dup_token,            # hToken
+        None,                 # appName
+        cmd_line,             # commandLine
+        None,                 # processAttributes (None = default)
+        None,                 # threadAttributes  (None = default)
+        False,                # bInheritHandles
+        (win32con.CREATE_NO_WINDOW
+         | win32con.NORMAL_PRIORITY_CLASS
+         | win32con.CREATE_UNICODE_ENVIRONMENT),
+        env,                  # newEnvironment
+        None,                 # currentDirectory
+        si,                   # startupinfo
+    )
+    thread_h.Close()
+    return pid, proc_h
+
+
+if platform.system() == "Windows":
+    try:
+        import threading
+        import win32con
+        import win32event
+        import win32process
+        import win32service
+        import win32serviceutil
+        import win32ts
+
+        class GBOXService(win32serviceutil.ServiceFramework):
+            _svc_name_ = "GBOXGUIServer"
+            _svc_display_name_ = "GBOX GUI Server"
+            _svc_description_ = (
+                "GBOX Local API Server – provides UI automation, command execution "
+                "and file system APIs on localhost:5789."
+            )
+            _svc_start_type_ = win32service.SERVICE_AUTO_START
+            # Receive SESSION_CHANGE notifications so we can (re)spawn on logon
+            _svc_controls_accepted_ = (
+                win32service.SERVICE_ACCEPT_STOP
+                | win32service.SERVICE_ACCEPT_SESSIONCHANGE
+            )
+
+            def __init__(self, args):
+                win32serviceutil.ServiceFramework.__init__(self, args)
+                self._stop_event = win32event.CreateEvent(None, 0, 0, None)
+                self._child_handle = None
+                self._child_pid = None
+                self._lock = threading.Lock()
+
+            # ------------------------------------------------------------------
+            def SvcStop(self):
+                self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+                self._kill_child()
+                win32event.SetEvent(self._stop_event)
+
+            # ------------------------------------------------------------------
+            def SvcOtherEx(self, control, event_type, data):
+                """Handle session-change events (logon / logoff / lock / unlock)."""
+                if control == win32service.SERVICE_CONTROL_SESSIONCHANGE:
+                    # WTS_SESSION_LOGON = 5, WTS_SESSION_UNLOCK = 8
+                    if event_type in (win32con.WTS_SESSION_LOGON,
+                                      win32con.WTS_SESSION_UNLOCK):
+                        session_id = data[0] if data else None
+                        self._ensure_child(session_id)
+                    # WTS_SESSION_LOGOFF = 6, WTS_SESSION_LOCK = 7
+                    elif event_type in (win32con.WTS_SESSION_LOGOFF,
+                                        win32con.WTS_SESSION_LOCK):
+                        self._kill_child()
+
+            # ------------------------------------------------------------------
+            def SvcDoRun(self):
+                import servicemanager
+                log_file = _setup_service_logging()
+                logging.info("[GBOXService] service starting; log=%s", log_file)
+                servicemanager.LogMsg(
+                    servicemanager.EVENTLOG_INFORMATION_TYPE,
+                    servicemanager.PYS_SERVICE_STARTED,
+                    (self._svc_name_, ""),
+                )
+                # Attempt immediate spawn in case a user is already logged in
+                active = _find_active_user_session()
+                logging.info("[GBOXService] initial session lookup => %s", active)
+                if active != 0xFFFFFFFF:
+                    self._ensure_child(active)
+
+                # Keep the service alive; a background watchdog revives the child
+                # if it dies unexpectedly (e.g. crash).
+                while True:
+                    rc = win32event.WaitForSingleObject(self._stop_event, 10_000)
+                    if rc == win32event.WAIT_OBJECT_0:
+                        break
+                    self._watchdog()
+
+            # ------------------------------------------------------------------
+            def _ensure_child(self, session_id=None):
+                with self._lock:
+                    if self._child_handle and self._is_child_alive():
+                        return
+                    if session_id is None:
+                        session_id = _find_active_user_session()
+                    if session_id == 0xFFFFFFFF:
+                        logging.debug("[GBOXService] no active user session found")
+                        return
+                    try:
+                        pid, handle = _spawn_in_user_session(session_id)
+                        self._child_pid = pid
+                        self._child_handle = handle
+                        logging.info("[GBOXService] spawned child pid=%d in session %d",
+                                     pid, session_id)
+                    except Exception:
+                        logging.exception("[GBOXService] failed to spawn child in session %d",
+                                          session_id)
+
+            def _kill_child(self):
+                with self._lock:
+                    if self._child_handle:
+                        try:
+                            win32process.TerminateProcess(self._child_handle, 0)
+                        except Exception:
+                            pass
+                        self._child_handle = None
+                        self._child_pid = None
+
+            def _is_child_alive(self) -> bool:
+                if not self._child_handle:
+                    return False
+                try:
+                    rc = win32event.WaitForSingleObject(self._child_handle, 0)
+                    return rc != win32event.WAIT_OBJECT_0  # OBJECT_0 means exited
+                except Exception:
+                    return False
+
+            def _watchdog(self):
+                need_respawn = False
+                with self._lock:
+                    if self._child_handle and not self._is_child_alive():
+                        logging.warning("[GBOXService] child exited unexpectedly; restarting")
+                        self._child_handle = None
+                        self._child_pid = None
+                    need_respawn = self._child_handle is None
+                if need_respawn:
+                    self._ensure_child()
+
+    except ImportError:
+        GBOXService = None  # pywin32 not available
+else:
+    GBOXService = None
+
+
+if __name__ == "__main__":
+    import sys
+
+    if platform.system() == "Windows":
+        if "--child" in sys.argv:
+            # Spawned by the SCM service into the user desktop session.
+            # Run the Flask server directly with no console window.
+            _run_server()
+        elif "--console" in sys.argv or "-c" in sys.argv:
+            # Explicit foreground/debug mode requested by the user.
+            _run_server()
+        elif len(sys.argv) == 1:
+            # No arguments: Windows SCM is starting the service process.
+            # Register with SCM via StartServiceCtrlDispatcher; if we are not
+            # being called from SCM (e.g. user double-clicks the exe) this raises
+            # an exception and we fall back to plain console mode.
+            if GBOXService is not None:
+                try:
+                    import servicemanager
+                    servicemanager.Initialize()
+                    servicemanager.PrepareToHostSingle(GBOXService)
+                    servicemanager.StartServiceCtrlDispatcher()
+                except Exception:
+                    _run_server()
+            else:
+                _run_server()
+        else:
+            # Service management sub-commands: install, remove, start, stop, …
+            if GBOXService is not None:
+                # Inject --startup auto before the 'install' subcommand so the
+                # service is registered as Automatic.  HandleCommandLine (getopt)
+                # requires options to appear BEFORE the subcommand word.
+                if "install" in sys.argv and "--startup" not in sys.argv:
+                    idx = sys.argv.index("install")
+                    sys.argv.insert(idx, "auto")
+                    sys.argv.insert(idx, "--startup")
+                win32serviceutil.HandleCommandLine(GBOXService)
+            else:
+                print("pywin32 is not installed; service management unavailable.")
+                sys.exit(1)
+    else:
+        # Non-Windows: plain foreground process
+        _run_server()
