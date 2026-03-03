@@ -25,7 +25,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: "pip"
 
       - name: Install dependencies
@@ -34,9 +34,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable with PyInstaller
+      - name: Write version info
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          Set-Content -Path _version.py -Value "GIT_COMMIT = '$short'" -Encoding UTF8
+
+      - name: Build executable
         run: |
           pyinstaller --onefile --name gbox-gui-server `
+            --add-data "_version.py;." `
+            --hidden-import _version `
             --hidden-import win32timezone `
             --hidden-import win32serviceutil `
             --hidden-import win32service `

@@ -24,6 +24,7 @@ import pyautogui
 import pyperclip
 from flask import Flask, jsonify, make_response, request
 from PIL import Image
+from PIL import PngImagePlugin  # noqa: force-load PNG plugin at import time so PyInstaller bundles it eagerly
 
 try:
     import mss
@@ -32,6 +33,12 @@ except ImportError:
 
 app = Flask(__name__)
 app.config["PROPAGATE_EXCEPTIONS"] = True
+
+try:
+    import _version
+    GIT_COMMIT = _version.GIT_COMMIT
+except Exception:
+    GIT_COMMIT = "unknown"
 
 pyautogui.PAUSE = 0.05
 pyautogui.FAILSAFE = False
@@ -89,25 +96,9 @@ def _parse_duration_ms(s, default_ms: int = 500) -> float:
 
 
 def _take_screenshot_b64(clip=None) -> str:
-    """Take a screenshot and return as base64-encoded PNG data URI."""
-    try:
-        img = pyautogui.screenshot()
-    except Exception:
-        if mss is None:
-            raise
-        with mss.mss() as sct:
-            monitor = sct.monitors[0]
-            shot = sct.grab(monitor)
-            img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
-    if clip:
-        x = int(clip.get("x", 0))
-        y = int(clip.get("y", 0))
-        w = int(clip.get("width", img.width))
-        h = int(clip.get("height", img.height))
-        img = img.crop((x, y, x + w, y + h))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode()
+    """Take a screenshot and return as base64-encoded PNG data URI. (legacy wrapper)"""
+    png_bytes = _take_screenshot_buf(clip)
+    b64 = base64.b64encode(png_bytes).decode()
     return f"data:image/png;base64,{b64}"
 
 
@@ -178,18 +169,18 @@ def _map_key(k: str) -> str:
 def _file_info(path: str) -> dict:
     p = Path(path)
     stat = p.stat()
-    last_modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
     try:
         mode = oct(stat.st_mode)[-3:]
     except Exception:
         mode = "644"
     if p.is_dir():
         return {
-            "type": "dir",
+            "type": "directory",
             "name": p.name,
             "path": str(p).replace("\\", "/") + "/",
             "mode": mode,
-            "lastModified": last_modified,
+            "modified": modified,
         }
     size_bytes = stat.st_size
     if size_bytes < 1024:
@@ -206,7 +197,7 @@ def _file_info(path: str) -> dict:
         "path": str(p).replace("\\", "/"),
         "size": size_str,
         "mode": mode,
-        "lastModified": last_modified,
+        "modified": modified,
     }
 
 
@@ -220,6 +211,11 @@ def _resolve_path(path: str, working_dir: Optional[str] = None) -> str:
 def _parse_timeout(timeout_str, default_s: float = 30.0) -> float:
     if timeout_str is None:
         return default_s
+    # Plain integer string (e.g. "30000") is treated as milliseconds
+    try:
+        return float(timeout_str) / 1000.0
+    except (ValueError, TypeError):
+        pass
     return _parse_duration_ms(timeout_str, int(default_s * 1000))
 
 
@@ -227,14 +223,83 @@ def _parse_timeout(timeout_str, default_s: float = 30.0) -> float:
 # UI Action Routes  /api/v1/actions/*
 # ---------------------------------------------------------------------------
 
+def _take_screenshot_buf(clip=None) -> bytes:
+    """Take a screenshot and return raw PNG bytes.
+
+    Prefer mss when available: it writes PNG natively via its own zlib path,
+    avoiding the lazy PIL plugin import that can fail in PyInstaller bundles
+    with a zlib decompression error (corrupted archive entry).
+    """
+    if mss is not None:
+        with mss.mss() as sct:
+            monitor = sct.monitors[0]
+            if clip:
+                region = {
+                    "left": int(clip.get("x", 0)),
+                    "top": int(clip.get("y", 0)),
+                    "width": int(clip.get("width", monitor["width"])),
+                    "height": int(clip.get("height", monitor["height"])),
+                }
+                shot = sct.grab(region)
+            else:
+                shot = sct.grab(monitor)
+            return mss.tools.to_png(shot.rgb, shot.size)
+
+    # Fallback: use pyautogui + PIL (requires PngImagePlugin to be importable)
+    img = pyautogui.screenshot()
+    if clip:
+        x = int(clip.get("x", 0))
+        y = int(clip.get("y", 0))
+        w = int(clip.get("width", img.width))
+        h = int(clip.get("height", img.height))
+        img = img.crop((x, y, x + w, y + h))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _put_to_presigned_url(png_bytes: bytes, presigned_put_url: str) -> None:
+    """Upload PNG bytes to a presigned S3 PUT URL."""
+    import urllib.request
+    req = urllib.request.Request(
+        presigned_put_url,
+        data=png_bytes,
+        method="PUT",
+        headers={"Content-Type": "image/png", "Content-Length": str(len(png_bytes))},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if resp.status not in (200, 204):
+            raise RuntimeError(f"Presigned PUT failed with HTTP {resp.status}")
+
+
 @app.route("/api/v1/actions/screenshot", methods=["POST"])
 def action_screenshot():
     import sys; print('[screenshot] request received', flush=True); sys.stdout.flush(); sys.stderr.flush()
     try:
         data = request.get_json(silent=True) or {}
+
+        # transferFormat: "base64" (default) or "storageKey"
+        transfer_format = data.get("transferFormat", "base64")
+        presigned_put_url = data.get("presignedPutUrl")
+        storage_key = data.get("storageKey")
+
         clip = data.get("clip")
-        uri = _take_screenshot_b64(clip)
-        return jsonify({"uri": uri})
+        png_bytes = _take_screenshot_buf(clip)
+
+        if transfer_format == "storageKey" and presigned_put_url:
+            # Upload directly to S3 via presigned PUT URL
+            _put_to_presigned_url(png_bytes, presigned_put_url)
+            return jsonify({
+                "storageKey": storage_key,
+                "outputFormat": "storageKey",
+            })
+        else:
+            # Return as base64 (raw, no data URI prefix so caller can build it)
+            image_b64 = base64.b64encode(png_bytes).decode()
+            return jsonify({
+                "uri": f"data:image/png;base64,{image_b64}",
+                "outputFormat": "base64",
+            })
     except Exception as e:
         traceback.print_exc()
         logging.exception("screenshot failed")
@@ -261,7 +326,15 @@ def action_click():
         return jsonify({"error": "x and y coordinates are required"}), 400
 
     button = data.get("button", "left")
+    # Support both 'clicks' (click count, from remote service) and 'double' (legacy boolean)
+    clicks_param = data.get("clicks")
     double = data.get("double", False)
+    if clicks_param is not None:
+        click_count = int(clicks_param)
+    elif double:
+        click_count = 2
+    else:
+        click_count = 1
     modifier_keys = data.get("modifierKeys", [])
 
     pyautogui_button = "left" if button == "left" else ("right" if button == "right" else "middle")
@@ -270,8 +343,10 @@ def action_click():
     for mod in mapped_modifiers:
         pyautogui.keyDown(mod)
     try:
-        if double:
+        if click_count == 2:
             pyautogui.doubleClick(x=int(x), y=int(y), button=pyautogui_button)
+        elif click_count > 2:
+            pyautogui.click(x=int(x), y=int(y), button=pyautogui_button, clicks=click_count)
         else:
             pyautogui.click(x=int(x), y=int(y), button=pyautogui_button)
     finally:
@@ -371,6 +446,7 @@ def action_scroll():
     screen_w, screen_h = pyautogui.size()
 
     if "scrollX" in data or "scrollY" in data:
+        # Absolute pixel delta mode: {x, y, scrollX, scrollY}
         x = int(data.get("x", screen_w // 2))
         y = int(data.get("y", screen_h // 2))
         scroll_x = data.get("scrollX", 0)
@@ -387,7 +463,28 @@ def action_scroll():
                 clicks = 1 if scroll_x > 0 else -1
             pyautogui.hscroll(clicks, x=x, y=y)
         actual = {"x": x, "y": y, "scrollX": scroll_x, "scrollY": scroll_y}
+    elif "direction" in data:
+        # Direction + click-count mode: {x, y, direction, clicks}
+        direction = data.get("direction", "up")
+        x = int(data.get("x", screen_w // 2))
+        y = int(data.get("y", screen_h // 2))
+        clicks_count = int(data.get("clicks", 3))
+        sx, sy = 0, 0
+        if direction == "up":
+            pyautogui.scroll(clicks_count, x=x, y=y)
+            sy = clicks_count * 100 // 3
+        elif direction == "down":
+            pyautogui.scroll(-clicks_count, x=x, y=y)
+            sy = -(clicks_count * 100 // 3)
+        elif direction == "left":
+            pyautogui.hscroll(-clicks_count, x=x, y=y)
+            sx = -(clicks_count * 100 // 3)
+        else:  # right
+            pyautogui.hscroll(clicks_count, x=x, y=y)
+            sx = clicks_count * 100 // 3
+        actual = {"x": x, "y": y, "scrollX": sx, "scrollY": sy}
     else:
+        # Legacy direction + distance mode
         direction = data.get("direction", "up")
         distance_raw = data.get("distance")
         x = screen_w // 2
@@ -450,6 +547,22 @@ def action_drag():
             "end": {"x": int(end["x"]), "y": int(end["y"])},
             "duration": duration_str,
         }
+    elif "startX" in data or "startY" in data:
+        # Flat coordinate mode: {startX, startY, endX, endY, duration?}
+        sx = int(data.get("startX", 0))
+        sy = int(data.get("startY", 0))
+        ex = int(data.get("endX", 0))
+        ey = int(data.get("endY", 0))
+        duration_val = data.get("duration")
+        dur = (duration_val / 1000.0) if isinstance(duration_val, (int, float)) else _parse_duration_ms(duration_val, 500)
+        pyautogui.mouseDown(x=sx, y=sy)
+        pyautogui.moveTo(ex, ey, duration=dur)
+        pyautogui.mouseUp(x=ex, y=ey)
+        actual = {
+            "start": {"x": sx, "y": sy},
+            "end": {"x": ex, "y": ey},
+            "duration": str(duration_val or "500ms"),
+        }
     else:
         start = data.get("start")
         end = data.get("end")
@@ -479,11 +592,210 @@ def action_drag():
     return jsonify(result)
 
 
+@app.route("/api/v1/actions/long-press", methods=["POST"])
+def action_long_press():
+    data = request.get_json(silent=True) or {}
+    action_id = _new_action_id()
+    x = data.get("x")
+    y = data.get("y")
+    if x is None or y is None:
+        return jsonify({"error": "x and y are required"}), 400
+    duration_str = data.get("duration", "500ms")
+    dur = _parse_duration_ms(duration_str, 500)
+    options = data.get("options")
+    phases = _get_screenshot_phases(options)
+    delay = _get_screenshot_delay(options)
+    before_uri = _take_screenshot_b64() if "before" in phases else None
+    pyautogui.mouseDown(x=int(x), y=int(y))
+    time.sleep(dur)
+    pyautogui.mouseUp(x=int(x), y=int(y))
+    after_uri = None
+    if "after" in phases:
+        time.sleep(delay)
+        after_uri = _take_screenshot_b64()
+    result = _action_result(action_id, options, before_uri, after_uri)
+    result["actual"] = {"x": int(x), "y": int(y), "duration": duration_str}
+    return jsonify(result)
+
+
+@app.route("/api/v1/actions/swipe", methods=["POST"])
+def action_swipe():
+    data = request.get_json(silent=True) or {}
+    action_id = _new_action_id()
+    start = data.get("start")
+    end = data.get("end")
+    if not start or not end:
+        return jsonify({"error": "start and end are required"}), 400
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return jsonify({"error": "start and end must be coordinate objects"}), 400
+    duration_str = data.get("duration", "300ms")
+    dur = _parse_duration_ms(duration_str, 300)
+    options = data.get("options")
+    phases = _get_screenshot_phases(options)
+    delay = _get_screenshot_delay(options)
+    before_uri = _take_screenshot_b64() if "before" in phases else None
+    sx, sy = int(start["x"]), int(start["y"])
+    ex, ey = int(end["x"]), int(end["y"])
+    pyautogui.mouseDown(x=sx, y=sy)
+    pyautogui.moveTo(ex, ey, duration=dur)
+    pyautogui.mouseUp(x=ex, y=ey)
+    after_uri = None
+    if "after" in phases:
+        time.sleep(delay)
+        after_uri = _take_screenshot_b64()
+    result = _action_result(action_id, options, before_uri, after_uri)
+    result["actual"] = {"start": {"x": sx, "y": sy}, "end": {"x": ex, "y": ey}, "duration": duration_str}
+    return jsonify(result)
+
+
+@app.route("/api/v1/actions/touch", methods=["POST"])
+def action_touch():
+    """Multi-touch simulation. Each point has a start position and a list of actions."""
+    data = request.get_json(silent=True) or {}
+    action_id = _new_action_id()
+    points = data.get("points", [])
+    if not points:
+        return jsonify({"error": "points is required"}), 400
+    options = data.get("options")
+    phases = _get_screenshot_phases(options)
+    delay = _get_screenshot_delay(options)
+    before_uri = _take_screenshot_b64() if "before" in phases else None
+
+    for point in points:
+        start = point.get("start", {})
+        cur_x = int(start.get("x", 0))
+        cur_y = int(start.get("y", 0))
+        pyautogui.moveTo(cur_x, cur_y)
+        for action in point.get("actions", []):
+            action_type = action.get("type", "")
+            if action_type == "move":
+                to_x = int(action.get("x", cur_x))
+                to_y = int(action.get("y", cur_y))
+                pyautogui.dragTo(to_x, to_y, duration=0.1, button="left")
+                cur_x, cur_y = to_x, to_y
+            elif action_type == "wait":
+                dur = _parse_duration_ms(action.get("duration", "100ms"), 100)
+                time.sleep(dur)
+            elif action_type == "click":
+                pyautogui.click(x=cur_x, y=cur_y)
+
+    after_uri = None
+    if "after" in phases:
+        time.sleep(delay)
+        after_uri = _take_screenshot_b64()
+    return jsonify(_action_result(action_id, options, before_uri, after_uri))
+
+
+@app.route("/api/v1/actions/press-button", methods=["POST"])
+def action_press_button():
+    """Press device hardware buttons (volume up/down, etc.)."""
+    data = request.get_json(silent=True) or {}
+    action_id = _new_action_id()
+    buttons = data.get("buttons", data.get("button", []))
+    if not buttons:
+        return jsonify({"error": "buttons is required"}), 400
+    options = data.get("options")
+    phases = _get_screenshot_phases(options)
+    delay = _get_screenshot_delay(options)
+    before_uri = _take_screenshot_b64() if "before" in phases else None
+
+    BUTTON_KEY_MAP = {
+        "volumeUp": "volumeup",
+        "volumeDown": "volumedown",
+        "volumeMute": "volumemute",
+        "home": "win",
+        "back": "alt+left",
+        "menu": "apps",
+    }
+    for btn in buttons:
+        key = BUTTON_KEY_MAP.get(btn)
+        if key is None:
+            return jsonify({"error": f"Unsupported button: {btn}"}), 400
+        if "+" in key:
+            parts = key.split("+")
+            pyautogui.hotkey(*parts)
+        else:
+            pyautogui.press(key)
+
+    after_uri = None
+    if "after" in phases:
+        time.sleep(delay)
+        after_uri = _take_screenshot_b64()
+    return jsonify(_action_result(action_id, options, before_uri, after_uri))
+
+
+@app.route("/api/v1/actions/screen-size", methods=["GET"])
+def action_get_screen_size():
+    """Return current screen resolution."""
+    w, h = pyautogui.size()
+    return jsonify({"width": w, "height": h})
+
+
+@app.route("/api/v1/actions/screen-resolution", methods=["POST"])
+def action_set_screen_resolution():
+    """Set screen resolution via OS command (Windows only)."""
+    data = request.get_json(silent=True) or {}
+    width = data.get("width")
+    height = data.get("height")
+    if width is None or height is None:
+        return jsonify({"error": "width and height are required"}), 400
+    width, height = int(width), int(height)
+
+    if platform_name == "Windows":
+        # Use PowerShell to change display resolution
+        ps_script = (
+            f"Add-Type -AssemblyName System.Windows.Forms; "
+            f"$mode = [System.Windows.Forms.Screen]::PrimaryScreen; "
+            f"$dm = New-Object System.Management.ManagementObject('Win32_VideoController.DeviceID=\"VideoController1\"'); "
+            f"& {{ "
+            f"  $signature = @'`n"
+            f"[DllImport(\"user32.dll\")] public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);`n"
+            f"[DllImport(\"user32.dll\")] public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);`n"
+            f"[StructLayout(LayoutKind.Sequential)] public struct DEVMODE {{ [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName; public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields; public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput; public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName; public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight; public int dmDisplayFlags; public int dmDisplayFrequency; }}`n"
+            f"'@`n"
+            f"  Add-Type -MemberDefinition $signature -Name NativeMethods -Namespace Win32`n"
+            f"  $dm = New-Object Win32.NativeMethods+DEVMODE`n"
+            f"  $dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)`n"
+            f"  [Win32.NativeMethods]::EnumDisplaySettings($null, -1, [ref]$dm) | Out-Null`n"
+            f"  $dm.dmPelsWidth = {width}`n"
+            f"  $dm.dmPelsHeight = {height}`n"
+            f"  $dm.dmFields = 0x180000`n"
+            f"  $result = [Win32.NativeMethods]::ChangeDisplaySettings([ref]$dm, 0)`n"
+            f"  exit $result`n"
+            f"}}"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform_name == "Windows" else 0
+            )
+            if result.returncode != 0:
+                return jsonify({"error": f"ChangeDisplaySettings returned {result.returncode}", "stderr": result.stderr}), 500
+            return jsonify({"message": f"Resolution set to {width}x{height}"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        # Linux/macOS: try xrandr
+        try:
+            result = subprocess.run(
+                ["xrandr", "--fb", f"{width}x{height}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return jsonify({"error": result.stderr or "xrandr failed"}), 500
+            return jsonify({"message": f"Resolution set to {width}x{height}"})
+        except FileNotFoundError:
+            return jsonify({"error": "xrandr not available"}), 501
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/v1/actions/clipboard", methods=["GET"])
 def action_get_clipboard():
     try:
-        content = pyperclip.paste()
-        return jsonify(content)
+        text = pyperclip.paste()
+        return jsonify({"text": text})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -491,11 +803,12 @@ def action_get_clipboard():
 @app.route("/api/v1/actions/clipboard", methods=["POST"])
 def action_set_clipboard():
     data = request.get_json(silent=True) or {}
-    content = data.get("content")
-    if content is None:
-        return jsonify({"error": "content is required"}), 400
+    # Accept both "text" (preferred) and "content" (legacy) fields
+    text = data.get("text") if data.get("text") is not None else data.get("content")
+    if text is None:
+        return jsonify({"error": "text is required"}), 400
     try:
-        pyperclip.copy(content)
+        pyperclip.copy(text)
         return jsonify({"message": "Clipboard set successfully"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -537,11 +850,12 @@ def exec_command():
         result = subprocess.run(command, **kwargs)
         return jsonify({
             "exitCode": result.returncode,
+            "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
         })
     except subprocess.TimeoutExpired:
-        return jsonify({"exitCode": 124, "stdout": "", "stderr": f"Command timed out after {timeout_sec}s"})
+        return jsonify({"exitCode": 124, "returncode": 124, "stdout": "", "stderr": f"Command timed out after {timeout_sec}s"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -578,7 +892,7 @@ def fs_list():
             pass
         return entries
 
-    return jsonify({"data": _list_dir(resolved, 1)})
+    return jsonify(_list_dir(resolved, 1))
 
 
 @app.route("/api/v1/fs/read", methods=["GET"])
@@ -642,9 +956,13 @@ def fs_write():
 
 @app.route("/api/v1/fs", methods=["DELETE"])
 def fs_delete():
-    data = request.get_json(silent=True) or {}
-    path = data.get("path")
-    working_dir = data.get("workingDir")
+    # Accept path from query params (preferred) or JSON body
+    path = request.args.get("path")
+    working_dir = request.args.get("workingDir")
+    if path is None:
+        data = request.get_json(silent=True) or {}
+        path = data.get("path")
+        working_dir = data.get("workingDir") or working_dir
     if not path:
         return jsonify({"error": "path is required"}), 400
     resolved = _resolve_path(path, working_dir)
@@ -670,7 +988,7 @@ def fs_exists():
     resolved = _resolve_path(path, working_dir)
     if not os.path.exists(resolved):
         return jsonify({"exists": False})
-    fs_type = "dir" if os.path.isdir(resolved) else "file"
+    fs_type = "directory" if os.path.isdir(resolved) else "file"
     return jsonify({"exists": True, "type": fs_type})
 
 
@@ -713,7 +1031,7 @@ def fs_get_info():
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "platform": platform_name})
+    return jsonify({"status": "ok", "platform": platform_name, "commit": GIT_COMMIT})
 
 
 def _wrap_wsgi_with_error_catch(wsgi_app):
